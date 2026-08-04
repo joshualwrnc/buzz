@@ -41,11 +41,9 @@ pub use anchor::store_anchor_dir;
 pub use codec::StoreDecodeError;
 pub use codec::{decode_agent_record_permissive, decode_agent_store, decode_team_store};
 
-pub use events::{
-    insert_inbox_event, insert_outbox_event, mark_outbox_published, InsertEventOutcome,
-};
+pub use events::{insert_inbox_event, mark_outbox_published};
 #[cfg(test)]
-pub use events::{read_inbox_events, read_outbox_events};
+pub use events::{insert_outbox_event, read_inbox_events, read_outbox_events, InsertEventOutcome};
 
 pub use generations::{cas_generation, read_generation, tombstone_key, CasOutcome, Generation};
 

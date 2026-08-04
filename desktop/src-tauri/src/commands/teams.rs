@@ -34,13 +34,12 @@ fn trim_optional(value: Option<String>) -> Option<String> {
 /// owner-authored, so the caller skips them — this helper assumes the team is
 /// publishable.
 ///
-/// Internal ordering: outbox journal evidence is written **before** the
-/// retention row is flushable.  Best-effort at the outer boundary: a failure
-/// is logged and swallowed so a hiccup never blocks the disk-authoritative write.
+/// Internal ordering (B1 journal protocol): outbox evidence inserted first via
+/// `prepare_publication` before the retention row is set flushable.
 pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &TeamRecord) {
     use crate::managed_agents::{
         persona_events::monotonic_created_at,
-        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
+        retention::{get_retained_event, open_retention_db},
         team_events::build_team_event,
     };
     use buzz_core_pkg::kind::KIND_TEAM;
@@ -60,8 +59,7 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
         let event_id = event.id.to_hex();
         let raw_json = event.as_json();
 
-        // B1 journal outbox: record the immutable event identity BEFORE
-        // the retention DB entry is set flushable.
+        // B1 journal outbox: record immutable event identity before retention.
         let anchor = crate::managed_agents::store_journal::store_anchor_dir(app)?;
         std::fs::create_dir_all(&anchor)
             .map_err(|e| format!("create anchor dir for team outbox: {e}"))?;
@@ -74,33 +72,18 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
             &team.id,
             crate::managed_agents::store_journal::Generation::zero(),
         )?;
-        use crate::managed_agents::store_journal::InsertEventOutcome;
-        match crate::managed_agents::store_journal::insert_outbox_event(
-            &journal,
-            &event_id,
-            &pub_op_id,
-            raw_json.as_bytes(),
-        )? {
-            InsertEventOutcome::Inserted | InsertEventOutcome::ExactDuplicate => {}
-            InsertEventOutcome::IdentityCollision => {
-                return Err(format!(
-                    "team-retain: outbox identity collision on event {event_id}"
-                ));
-            }
-        }
 
-        // Retention row after outbox evidence.
-        retain_event(
+        crate::managed_agents::store_journal::prepare_publication(
+            &journal,
             &conn,
-            &RetainedEvent {
-                kind: KIND_TEAM,
-                pubkey,
-                d_tag: team.id.clone(),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: raw_json,
-                pending_sync: true,
-            },
+            &pub_op_id,
+            &event_id,
+            &raw_json,
+            KIND_TEAM,
+            &pubkey,
+            &team.id,
+            &event.content,
+            event.created_at.as_secs() as i64,
         )
     })();
     if let Err(e) = result {
@@ -117,12 +100,12 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
 /// `(5, pubkey, d_tag)` coordinate with `pending_sync = 1`. Best-effort: a
 /// failure is logged and swallowed so a retention hiccup never blocks the
 /// disk-authoritative delete.
+///
+/// Internal ordering (B1 journal protocol): outbox evidence inserted first via
+/// `prepare_publication` before the retention row is set flushable.
 fn tombstone_team_pending(app: &AppHandle, state: &AppState, d_tag: &str) {
     use crate::managed_agents::{
-        retention::{
-            delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-            RetainedEvent,
-        },
+        retention::{delete_retained_event, open_retention_db, tombstone_retention_d_tag},
         team_events::build_team_delete,
     };
     use buzz_core_pkg::kind::KIND_TEAM;
@@ -136,21 +119,38 @@ fn tombstone_team_pending(app: &AppHandle, state: &AppState, d_tag: &str) {
         let event = build_team_delete(d_tag, &pubkey)?
             .sign_with_keys(&scope.owner_keys)
             .map_err(|e| format!("failed to sign team tombstone: {e}"))?;
+        let event_id = event.id.to_hex();
+        let raw_json = event.as_json();
+        let tombstone_d_tag = tombstone_retention_d_tag(KIND_TEAM, d_tag);
+
         let conn = open_retention_db(&scope.db_path)?;
         delete_retained_event(&conn, KIND_TEAM, &pubkey, d_tag)?;
-        retain_event(
+
+        // B1 journal outbox: record immutable tombstone identity before retention.
+        let anchor = crate::managed_agents::store_journal::store_anchor_dir(app)?;
+        std::fs::create_dir_all(&anchor)
+            .map_err(|e| format!("create anchor dir for team tombstone outbox: {e}"))?;
+        let journal = crate::managed_agents::store_journal::open_journal(&anchor)?;
+        let pub_op_id = crate::managed_agents::store_journal::new_operation_id();
+        crate::managed_agents::store_journal::insert_operation(
+            &journal,
+            &pub_op_id,
+            "tombstone",
+            d_tag,
+            crate::managed_agents::store_journal::Generation::zero(),
+        )?;
+
+        crate::managed_agents::store_journal::prepare_publication(
+            &journal,
             &conn,
-            &RetainedEvent {
-                kind: KIND_DELETE,
-                pubkey,
-                // Key by the target coordinate so cross-kind d-tag tombstones
-                // occupy distinct rows (F2c).
-                d_tag: tombstone_retention_d_tag(KIND_TEAM, d_tag),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
+            &pub_op_id,
+            &event_id,
+            &raw_json,
+            KIND_DELETE,
+            &pubkey,
+            &tombstone_d_tag,
+            &event.content,
+            event.created_at.as_secs() as i64,
         )
     })();
     if let Err(e) = result {

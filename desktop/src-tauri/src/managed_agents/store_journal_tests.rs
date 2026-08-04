@@ -8,10 +8,10 @@ use rusqlite::Connection;
 use super::{
     advance_disposition, apply_journal_schema_pub, atomic_write_with_fsync,
     canonical_dev_anchor_pub, cas_generation, decode_agent_store, decode_team_store,
-    insert_inbox_event, insert_operation, insert_outbox_event, open_journal, pin_compensation,
-    read_generation, read_inbox_events, read_nonterminal_operations, read_operation,
-    read_outbox_events, set_nonterminal_follow_up, tombstone_key, CasOutcome, Disposition,
-    Generation, InsertEventOutcome, JournalLockGuard, TransitionOutcome,
+    insert_inbox_event, insert_operation, insert_outbox_event, mark_outbox_published, open_journal,
+    pin_compensation, read_generation, read_inbox_events, read_nonterminal_operations,
+    read_operation, read_outbox_events, set_nonterminal_follow_up, tombstone_key, CasOutcome,
+    Disposition, Generation, InsertEventOutcome, JournalLockGuard, TransitionOutcome,
 };
 
 fn in_memory_journal() -> Connection {
@@ -43,9 +43,7 @@ fn test_cas_generation_first_write_succeeds() {
 #[test]
 fn test_cas_generation_conflict_returns_current() {
     let conn = in_memory_journal();
-    // Advance to gen 1 first.
     cas_generation(&conn, "key1", Generation::zero()).unwrap();
-    // CAS with stale expected=0 should conflict.
     let result = cas_generation(&conn, "key1", Generation::zero()).unwrap();
     assert!(
         matches!(
@@ -74,9 +72,7 @@ fn test_cas_generation_monotonically_increasing() {
 #[test]
 fn test_tombstone_prevents_aba_recreate() {
     let conn = in_memory_journal();
-    // Create at gen 0 → gen 1.
     cas_generation(&conn, "key1", Generation::zero()).unwrap();
-    // Tombstone at gen 1 → gen 2.
     let tomb = tombstone_key(&conn, "key1", Generation(1)).unwrap();
     assert!(
         matches!(
@@ -87,8 +83,6 @@ fn test_tombstone_prevents_aba_recreate() {
         ),
         "expected tombstone gen 2, got {tomb:?}"
     );
-
-    // Any further CAS is rejected by tombstone — even at gen 2.
     let aba = cas_generation(&conn, "key1", Generation(2)).unwrap();
     assert!(
         matches!(aba, CasOutcome::Tombstoned { .. }),
@@ -101,8 +95,6 @@ fn test_tombstone_generation_retained_forever() {
     let conn = in_memory_journal();
     cas_generation(&conn, "key1", Generation::zero()).unwrap();
     tombstone_key(&conn, "key1", Generation(1)).unwrap();
-
-    // Read still returns the tombstone generation.
     let (gen, is_tombstone) = read_generation(&conn, "key1").unwrap();
     assert!(is_tombstone, "should be tombstoned");
     assert_eq!(gen, Generation(2), "tombstone gen should be 2");
@@ -205,7 +197,6 @@ fn test_read_nonterminal_operations_excludes_terminal() {
         &Disposition::Compensated,
     )
     .unwrap();
-
     let nonterminal = read_nonterminal_operations(&conn).unwrap();
     let ids: Vec<&str> = nonterminal
         .iter()
@@ -230,14 +221,12 @@ fn test_outbox_insert_is_idempotent() {
         InsertEventOutcome::Inserted,
         "first insert must be Inserted"
     );
-    // Duplicate insert with identical payload is an ExactDuplicate.
     let r2 = insert_outbox_event(&conn, "ev-1", "op-out", payload).unwrap();
     assert_eq!(
         r2,
         InsertEventOutcome::ExactDuplicate,
         "same payload must be ExactDuplicate"
     );
-
     let rows = read_outbox_events(&conn, "op-out").unwrap();
     assert_eq!(rows.len(), 1, "must have exactly one outbox row");
     assert_eq!(rows[0].1, payload);
@@ -248,7 +237,6 @@ fn test_outbox_insert_identity_collision_fails_closed() {
     let conn = in_memory_journal();
     insert_operation(&conn, "op-out2", "create", "k1", Generation(0)).unwrap();
     insert_outbox_event(&conn, "ev-col", "op-out2", b"payload-a").unwrap();
-    // Same event_id, different payload → IdentityCollision.
     let r = insert_outbox_event(&conn, "ev-col", "op-out2", b"payload-b").unwrap();
     assert_eq!(r, InsertEventOutcome::IdentityCollision);
 }
@@ -262,7 +250,6 @@ fn test_inbox_insert_is_idempotent() {
     assert_eq!(r1, InsertEventOutcome::Inserted);
     let r2 = insert_inbox_event(&conn, "in-1", "op-in", payload).unwrap();
     assert_eq!(r2, InsertEventOutcome::ExactDuplicate);
-
     let rows = read_inbox_events(&conn, "op-in").unwrap();
     assert_eq!(rows.len(), 1, "must have exactly one inbox row");
     assert_eq!(rows[0].1, payload);
@@ -311,9 +298,7 @@ fn test_atomic_write_with_fsync_symlink_preserved() {
     let link = dir.path().join("link.json");
     std::fs::write(&real, b"[]").unwrap();
     std::os::unix::fs::symlink(&real, &link).unwrap();
-
     atomic_write_with_fsync(&link, b"[1]").unwrap();
-    // The symlink must still point at real, and real must have the new content.
     assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read(&real).unwrap(), b"[1]");
 }
@@ -322,7 +307,6 @@ fn test_atomic_write_with_fsync_symlink_preserved() {
 fn test_atomic_write_with_fsync_first_boot_no_file() {
     let dir = tmp_dir();
     let path = dir.path().join("new.json");
-    // File does not yet exist.
     atomic_write_with_fsync(&path, b"[]").unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"[]");
 }
@@ -361,7 +345,6 @@ fn test_saga_crash_mid_compensation_recovers() {
     insert_operation(&conn, "op-crash", "create", "k1", Generation(0)).unwrap();
     cas_generation(&conn, "k1", Generation(0)).unwrap();
     pin_compensation(&conn, "op-crash", "comp-1", Generation(1)).unwrap();
-
     let ops = read_nonterminal_operations(&conn).unwrap();
     assert_eq!(ops.len(), 1);
     assert_eq!(ops[0].disposition, Disposition::Compensating);
@@ -380,11 +363,9 @@ fn test_saga_uncertain_publication_sets_follow_up() {
     )
     .unwrap();
     set_nonterminal_follow_up(&conn, "op-unc", &Disposition::Uncertain, true).unwrap();
-
     let op = read_operation(&conn, "op-unc").unwrap().unwrap();
     assert!(op.disposition.requires_follow_up());
     assert!(op.nonterminal_follow_up);
-
     advance_disposition(
         &conn,
         "op-unc",
@@ -393,7 +374,6 @@ fn test_saga_uncertain_publication_sets_follow_up() {
     )
     .unwrap();
     set_nonterminal_follow_up(&conn, "op-unc", &Disposition::Committed, false).unwrap();
-
     let op2 = read_operation(&conn, "op-unc").unwrap().unwrap();
     assert!(op2.disposition.is_terminal());
     assert!(!op2.nonterminal_follow_up);
@@ -406,19 +386,13 @@ fn test_two_threads_serialised_by_advisory_lock() {
     let barrier = Arc::new(Barrier::new(2));
     let anchor2 = anchor.clone();
     let barrier2 = barrier.clone();
-
-    // Thread A acquires the lock, writes a file, then releases.
     let handle = thread::spawn(move || {
         let _guard = JournalLockGuard::acquire(&anchor2).unwrap();
         std::fs::write(anchor2.join("data.txt"), b"A").unwrap();
         barrier2.wait(); // signal that A has written and holds the lock
-                         // Keep lock held briefly so B has to wait.
         thread::sleep(std::time::Duration::from_millis(20));
-        // Lock released on drop.
     });
-
     barrier.wait(); // wait until A holds the lock
-                    // B must block until A releases, then read A's data.
     let _guard = JournalLockGuard::acquire(&anchor).unwrap();
     let content = std::fs::read(anchor.join("data.txt")).unwrap();
     assert_eq!(content, b"A");
@@ -429,17 +403,13 @@ fn test_two_threads_serialised_by_advisory_lock() {
 fn test_open_journal_creates_on_first_boot() {
     let dir = tmp_dir();
     let anchor = dir.path().to_path_buf();
-    // No JSON files exist yet; journal creation must not error.
     let conn = open_journal(&anchor).unwrap();
-    // Should be able to query empty tables.
     let ops = read_nonterminal_operations(&conn).unwrap();
     assert!(ops.is_empty());
 }
 
 #[test]
 fn test_decode_agent_store_absent_file_empty_vec() {
-    // Callers read the file before calling decode; an absent file → empty vec,
-    // not a parse error.  Verify our convention: None/absent → Ok(vec![]).
     let result = decode_agent_store(b"[]").unwrap();
     assert!(result.is_empty());
 }
@@ -448,7 +418,6 @@ fn test_decode_agent_store_absent_file_empty_vec() {
 fn test_advance_disposition_wrong_expected_returns_conflict() {
     let conn = in_memory_journal();
     insert_operation(&conn, "op-conflict", "create", "k1", Generation(0)).unwrap();
-    // Op is Pending; try to advance from Committed (wrong expected) → Conflict.
     let outcome = advance_disposition(
         &conn,
         "op-conflict",
@@ -460,7 +429,6 @@ fn test_advance_disposition_wrong_expected_returns_conflict() {
         matches!(outcome, TransitionOutcome::Conflict { .. }),
         "wrong expected must → Conflict"
     );
-    // Op must still be Pending — no silent mutation.
     let op = read_operation(&conn, "op-conflict").unwrap().unwrap();
     assert_eq!(
         op.disposition,
@@ -509,20 +477,15 @@ fn test_mutate_store_malformed_agents_json_is_fail_closed() {
     let agents_path = dir.path().join("managed-agents.json");
     let bad_bytes = b"{\"this is\":\"not a valid agent array\"}";
     std::fs::write(&agents_path, bad_bytes).unwrap();
-
-    // Exercise decode_agent_store — same fail-closed codec path mutate_store uses.
     assert!(
         decode_agent_store(bad_bytes).is_err(),
         "malformed JSON array must fail closed"
     );
-    // Bytes on disk must be byte-identical — no mutation.
     assert_eq!(std::fs::read(&agents_path).unwrap(), bad_bytes);
 }
 
 #[test]
 fn test_decode_agent_store_unknown_field_fails_closed() {
-    // An extra top-level field inside a record must be rejected because
-    // ManagedAgentRecord carries #[serde(deny_unknown_fields)].
     let bytes = br#"[{"pubkey":"abc","name":"test","slug":"test-slug",
         "system_prompt":"","private_key_nsec":"","created_at":"","updated_at":"",
         "respond_to":"everyone","respond_to_allowlist":[],"relay_url":"",
@@ -538,7 +501,6 @@ fn test_decode_agent_store_unknown_field_fails_closed() {
 
 #[test]
 fn test_decode_team_store_unknown_field_fails_closed() {
-    // TeamRecord also carries #[serde(deny_unknown_fields)].
     let bytes = br#"[{"id":"team-1","name":"My Team","personas":[],
         "agents":[],"__extra__":"bad"}]"#;
     let result = decode_team_store(bytes);
@@ -555,12 +517,10 @@ fn test_two_threads_serialised_by_advisory_lock_via_journal() {
     let counter_path = anchor.join("counter.txt");
     std::fs::create_dir_all(&anchor).unwrap();
     std::fs::write(&counter_path, b"0").unwrap();
-
     let anchor_a = anchor.clone();
     let counter_a = counter_path.clone();
     let barrier = Arc::new(Barrier::new(2));
     let barrier2 = barrier.clone();
-
     let handle = thread::spawn(move || {
         let _guard = JournalLockGuard::acquire(&anchor_a).unwrap();
         let v: u32 = std::fs::read_to_string(&counter_a)
@@ -572,7 +532,6 @@ fn test_two_threads_serialised_by_advisory_lock_via_journal() {
         barrier2.wait();
         thread::sleep(std::time::Duration::from_millis(20));
     });
-
     barrier.wait();
     let _guard = JournalLockGuard::acquire(&anchor).unwrap();
     let final_val: u32 = std::fs::read_to_string(&counter_path)
@@ -592,9 +551,6 @@ fn test_boot_recovery_marks_no_evidence_op_failed_on_reopen() {
 
     let dir = tmp_dir();
     let anchor = dir.path().to_path_buf();
-
-    // Phase 1: open journal, insert a pending op with no outbox evidence, then
-    // close the connection (simulating a crash before completion).
     {
         let journal = open_journal(&anchor).unwrap();
         insert_operation(
@@ -605,13 +561,9 @@ fn test_boot_recovery_marks_no_evidence_op_failed_on_reopen() {
             Generation(0),
         )
         .unwrap();
-        // Connection dropped here — journal closed.
     }
 
-    // Phase 2: run_boot_recovery_at opens a fresh connection (real reopen).
     run_boot_recovery_at(&anchor, None).unwrap();
-
-    // Phase 3: verify the op was advanced to Failed (no outbox evidence).
     let journal = open_journal(&anchor).unwrap();
     let op = read_operation(&journal, "op-crash-1")
         .unwrap()
@@ -621,7 +573,6 @@ fn test_boot_recovery_marks_no_evidence_op_failed_on_reopen() {
         Disposition::Failed,
         "no-evidence op must be Failed"
     );
-    // The operation must be terminal and excluded from future nonterminal reads.
     assert!(op.disposition.is_terminal());
     let remaining = read_nonterminal_operations(&journal).unwrap();
     assert!(
@@ -638,8 +589,6 @@ fn test_boot_recovery_leaves_pending_outbox_op_for_redriving() {
 
     let dir = tmp_dir();
     let anchor = dir.path().to_path_buf();
-
-    // Phase 1: insert op + outbox event, then close.
     {
         let journal = open_journal(&anchor).unwrap();
         insert_operation(&journal, "op-outbox-1", "publish", "key-pub", Generation(0)).unwrap();
@@ -650,13 +599,9 @@ fn test_boot_recovery_leaves_pending_outbox_op_for_redriving() {
             b"{\"id\":\"ev-pub-1\"}",
         )
         .unwrap();
-        // Connection dropped here.
     }
 
-    // Phase 2: recovery.
     run_boot_recovery_at(&anchor, None).unwrap();
-
-    // Phase 3: op must remain Pending (flush loop re-drives it).
     let journal = open_journal(&anchor).unwrap();
     let op = read_operation(&journal, "op-outbox-1")
         .unwrap()
@@ -681,7 +626,6 @@ fn test_boot_recovery_keyring_write_with_inbox_marks_failed() {
 
     let dir = tmp_dir();
     let anchor = dir.path().to_path_buf();
-
     {
         let journal = open_journal(&anchor).unwrap();
         insert_operation(
@@ -692,13 +636,10 @@ fn test_boot_recovery_keyring_write_with_inbox_marks_failed() {
             Generation(0),
         )
         .unwrap();
-        // Insert inbox pre-image (pubkey bytes).
         insert_inbox_event(&journal, "in-kr-1", "op-kr-1", b"pubkey-bytes").unwrap();
-        // No outbox event — write was interrupted before completion.
     }
 
     run_boot_recovery_at(&anchor, None).unwrap();
-
     let journal = open_journal(&anchor).unwrap();
     let op = read_operation(&journal, "op-kr-1")
         .unwrap()
@@ -707,6 +648,98 @@ fn test_boot_recovery_keyring_write_with_inbox_marks_failed() {
         op.disposition,
         Disposition::Failed,
         "interrupted keyring_write must be Failed"
+    );
+}
+
+/// Boot recovery re-inserts a missing retention row from the immutable outbox
+/// payload, then simulates the flush loop advancing the owning op to Committed.
+/// A second recovery pass finds no nonterminal ops — published exactly once.
+#[test]
+fn test_boot_recovery_journal_only_evidence_published_terminal_once() {
+    use super::run_boot_recovery_at;
+    use crate::managed_agents::retention::{get_pending_sync, mark_synced, open_retention_db};
+    use nostr::JsonUtil;
+
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+    let retention_db_path = anchor.join("retention.db");
+    let keys = nostr::Keys::generate();
+    let owner_pubkey = keys.public_key().to_hex();
+    let event = nostr::EventBuilder::new(nostr::Kind::Custom(30177), "test-content")
+        .tag(nostr::Tag::identifier("test-agent"))
+        .sign_with_keys(&keys)
+        .unwrap();
+    let event_id = event.id.to_hex();
+    let raw_payload = event.as_json();
+    {
+        let journal = open_journal(&anchor).unwrap();
+        insert_operation(&journal, "op-pub-1", "publish", "test-agent", Generation(0)).unwrap();
+        insert_outbox_event(&journal, &event_id, "op-pub-1", raw_payload.as_bytes()).unwrap();
+    }
+    let conn = open_retention_db(&retention_db_path).unwrap();
+    assert!(
+        get_pending_sync(&conn).unwrap().is_empty(),
+        "no retention rows before recovery"
+    );
+    drop(conn);
+    run_boot_recovery_at(&anchor, Some(&retention_db_path)).unwrap();
+    let conn = open_retention_db(&retention_db_path).unwrap();
+    let pending = get_pending_sync(&conn).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "recovery must re-insert exactly one pending_sync row"
+    );
+    let row = &pending[0];
+    assert_eq!(row.d_tag, "test-agent");
+    assert_eq!(row.pubkey, owner_pubkey);
+    let journal = open_journal(&anchor).unwrap();
+    let op = read_operation(&journal, "op-pub-1").unwrap().unwrap();
+    assert_eq!(
+        op.disposition,
+        Disposition::Pending,
+        "op must stay Pending after recovery"
+    );
+    mark_synced(
+        &conn,
+        row.kind,
+        &row.pubkey,
+        &row.d_tag,
+        row.created_at,
+        &row.content,
+    )
+    .unwrap();
+    assert!(mark_outbox_published(&journal, &event_id, 0, 1).unwrap());
+    let pending_siblings: i64 = journal
+        .query_row(
+            "SELECT COUNT(*) FROM outbox_events WHERE operation_id = ?1 AND published_state = 0",
+            rusqlite::params!["op-pub-1"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending_siblings, 0);
+    advance_disposition(
+        &journal,
+        "op-pub-1",
+        &Disposition::Pending,
+        &Disposition::Committed,
+    )
+    .unwrap();
+    drop(journal);
+    run_boot_recovery_at(&anchor, Some(&retention_db_path)).unwrap();
+    let journal = open_journal(&anchor).unwrap();
+    let op = read_operation(&journal, "op-pub-1").unwrap().unwrap();
+    assert_eq!(
+        op.disposition,
+        Disposition::Committed,
+        "op must remain Committed"
+    );
+    assert!(
+        read_nonterminal_operations(&journal)
+            .unwrap()
+            .iter()
+            .all(|o| o.operation_id != "op-pub-1"),
+        "committed op must not appear in nonterminal"
     );
 }
 
@@ -721,7 +754,6 @@ pub fn maybe_run_subprocess_helper() {
                 .expect("STORE_JOURNAL_TEST_DIR must be set for writer role");
             let anchor = std::path::PathBuf::from(&dir);
             let output_path = anchor.join("output.txt");
-
             let _guard =
                 JournalLockGuard::acquire(&anchor).expect("subprocess: acquire advisory lock");
             let mut file = std::fs::OpenOptions::new()
@@ -736,9 +768,6 @@ pub fn maybe_run_subprocess_helper() {
             std::process::exit(0);
         }
         "json_mutator" => {
-            // Subprocess B: acquires advisory lock, typed-decodes managed-agents.json
-            // (deny_unknown_fields path, same as mutate_store), appends one record,
-            // atomically writes back — proves no lost-update under OS serialisation.
             let dir = std::env::var("STORE_JOURNAL_TEST_DIR")
                 .expect("STORE_JOURNAL_TEST_DIR must be set for json_mutator role");
             let anchor = std::path::PathBuf::from(&dir);
@@ -768,21 +797,15 @@ fn subprocess_mode_check() {
     maybe_run_subprocess_helper();
 }
 
-/// Two real processes serialised by the advisory lock.
-///
-/// Process A (this process) acquires the lock, writes "from-a\n" to output.txt,
-/// then spawns process B (this test binary re-invoked as a subprocess with
-/// `STORE_JOURNAL_TEST_ROLE=writer`) which must block until A releases.
-/// After B exits, we verify output.txt contains both lines in order — proving
-/// the lock serialised them.
+/// Two real processes serialised by the advisory lock. Process A acquires,
+/// writes "from-a\n", spawns B which blocks until A releases, then B writes.
+/// Output must contain both lines in order.
 #[test]
 fn test_two_processes_serialised_by_advisory_lock() {
     let dir = tmp_dir();
     let anchor = dir.path().to_path_buf();
     std::fs::create_dir_all(&anchor).unwrap();
     let output_path = anchor.join("output.txt");
-
-    // Phase 1: process A (this process) acquires the lock and writes.
     {
         let _guard = JournalLockGuard::acquire(&anchor).unwrap();
         let mut file = std::fs::OpenOptions::new()
@@ -793,29 +816,17 @@ fn test_two_processes_serialised_by_advisory_lock() {
         use std::io::Write;
         writeln!(file, "from-a").unwrap();
         drop(file);
-
-        // Phase 2: while A holds the lock, spawn process B.
-        // B will block on lock acquisition until A's guard drops.
         let exe = std::env::current_exe().expect("current_exe must be available in tests");
         let mut child = std::process::Command::new(&exe)
             .env("STORE_JOURNAL_TEST_ROLE", "writer")
             .env("STORE_JOURNAL_TEST_DIR", anchor.to_str().unwrap())
-            // Suppress cargo test output from the subprocess.
             .env("RUST_TEST_NOCAPTURE", "0")
-            // Filter to only the subprocess sentinel so B doesn't run all tests.
             .arg("subprocess_mode_check")
             .arg("--test-threads=1")
             .spawn()
             .expect("failed to spawn writer subprocess");
-
-        // Hold the lock for 80ms to ensure B is waiting.
         std::thread::sleep(std::time::Duration::from_millis(80));
-
-        // Phase 3: A releases the lock (guard drops at end of block).
-        // B will now acquire and write.
         drop(_guard);
-
-        // Wait for B to finish.
         let status = child.wait().expect("subprocess must finish");
         assert!(
             status.success(),
@@ -823,7 +834,6 @@ fn test_two_processes_serialised_by_advisory_lock() {
         );
     }
 
-    // Phase 4: read output.txt and verify both lines are present in order.
     let content = std::fs::read_to_string(&output_path).unwrap();
     let lines: Vec<&str> = content.lines().collect();
     assert_eq!(
@@ -833,29 +843,21 @@ fn test_two_processes_serialised_by_advisory_lock() {
     );
 }
 
-/// Two real processes, no lost update: advisory lock serialises
-/// lock-acquire → decode → mutate → write across OS process boundaries.
-/// Seed has 1 record, A adds 1 under lock, spawns B which must block until A
-/// releases, B adds 1. Final count must be 3 — not 2 (lost-update result).
+/// Two real processes, no lost update. Seed=1 record, A appends 1 under lock,
+/// spawns B which blocks, B appends 1. Final count must be 3 (2 = lost-update).
 #[test]
 fn test_two_processes_no_lost_json_update() {
     let dir = tmp_dir();
     let anchor = dir.path().to_path_buf();
     std::fs::create_dir_all(&anchor).unwrap();
     let agents_path = anchor.join("managed-agents.json");
-
-    // Seed: one valid typed agent record.
     std::fs::write(&agents_path, minimal_agents_json("seed_agent")).unwrap();
-
     {
         let _guard = JournalLockGuard::acquire(&anchor).unwrap();
-
-        // A: typed decode → append → write (mirrors mutate_store).
         let mut records = decode_agent_store(&std::fs::read(&agents_path).unwrap()).unwrap();
         records.extend(decode_agent_store(&minimal_agents_json("process_a_agent")).unwrap());
         atomic_write_with_fsync(&agents_path, &serde_json::to_vec_pretty(&records).unwrap())
             .unwrap();
-
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = std::process::Command::new(&exe)
             .env("STORE_JOURNAL_TEST_ROLE", "json_mutator")
@@ -873,7 +875,6 @@ fn test_two_processes_no_lost_json_update() {
         );
     }
 
-    // seed + A + B = 3; a lost-update yields 2.
     let records = decode_agent_store(&std::fs::read(&agents_path).unwrap()).unwrap();
     let pubkeys: Vec<&str> = records.iter().map(|r| r.pubkey.as_str()).collect();
     assert_eq!(records.len(), 3, "lost-update: got {pubkeys:?}");
@@ -966,12 +967,10 @@ fn test_crash_recovery_file_commit_phases() {
         let t_stage = anchor.join("teams.json.stage");
         let a_can = anchor.join("managed-agents.json");
         let t_can = anchor.join("teams.json");
-
         wr(pre[0], &a_stage, minimal_agents_json(pk));
         wr(pre[1], &t_stage, empty_teams_json());
         wr(pre[2], &a_can, minimal_agents_json(pk));
         wr(pre[3], &t_can, empty_teams_json());
-
         let j = open_journal(&anchor).unwrap();
         insert_file_commit_phase_row(
             &j,
@@ -981,12 +980,9 @@ fn test_crash_recovery_file_commit_phases() {
             t_stage.to_str().unwrap(),
         );
         drop(j);
-
         run_boot_recovery_at(&anchor, None).unwrap();
-
         assert_eq!(a_can.exists(), *a_exists, "{pk} agents_can");
         assert_eq!(t_can.exists(), *t_exists, "{pk} teams_can");
-
         if *a_exists {
             let recs = decode_agent_store(&std::fs::read(&a_can).unwrap()).unwrap();
             assert_eq!(recs.len(), 1);
